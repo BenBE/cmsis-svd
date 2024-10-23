@@ -65,7 +65,10 @@ setup(
     extras_require={
         'DEV': [
             'nose2',
-        ]
+        ],
+        'zstd': [
+            'pyzstd>=0.16'
+        ],
     },
     package_data={
         'cmsis_svd': ['py.typed'],
