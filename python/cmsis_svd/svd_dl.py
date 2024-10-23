@@ -27,6 +27,7 @@ import socket
 import tarfile
 import time
 
+from abc import ABC, abstractmethod
 from typing import Dict, Optional, Union
 from urllib import request
 from urllib.error import HTTPError
@@ -51,22 +52,161 @@ def print(*args, **kwargs):
 
 
 INDEX_JSON = 'index.json'
-INDEX_JSON_GZIP = INDEX_JSON + '.gz'
-INDEX_JSON_ZSTD = INDEX_JSON + '.zstd'
 INDEX_HASH = 'index.hash'
 
 CMSIS_SVD_DATA_URL = ('https://raw.githubusercontent.com'
                       '/cmsis-svd/cmsis-svd-data/refs/heads/svd-indexer')
 
 LOCAL_DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
-LOCAL_DATA_INDEX_JSON = os.path.join(LOCAL_DATA_DIR, INDEX_JSON)
-LOCAL_DATA_INDEX_JSON_GZIP = os.path.join(LOCAL_DATA_DIR, INDEX_JSON_GZIP)
-LOCAL_DATA_INDEX_JSON_ZSTD = os.path.join(LOCAL_DATA_DIR, INDEX_JSON_ZSTD)
-LOCAL_DATA_INDEX_HASH = os.path.join(LOCAL_DATA_DIR, INDEX_HASH)
 
 
 class SvdDlError(Exception):
     pass
+
+
+class SvdDlFormat(ABC):
+    @property
+    @abstractmethod
+    def id(self) -> str:
+        pass
+
+    @property
+    def prio(self) -> int:
+        return 0
+
+    @property
+    def available(self) -> bool:
+        return False
+
+    @property
+    @abstractmethod
+    def fileext(self) -> str:
+        pass
+
+    @staticmethod
+    @abstractmethod
+    def _decompress_file(compressed: str, target: str) -> None:
+        pass
+
+    @staticmethod
+    @abstractmethod
+    def _decompress_archive(compressed: str, path: str, targets: Dict[str, str]) -> None:
+        pass
+
+    def _add_fileext(filename: str) -> str:
+        return filename + self.fileext
+
+    @staticmethod
+    def _gen_extract_filter(datadir: str, targets: Dict[str, str]) -> callable:
+        def impl(entry: tarfile.TarInfo, extractpath: str) -> Optional[tarfile.TarInfo]:
+            if not entry.isreg():
+                return None
+
+            if entry.name not in targets.values():
+                return None
+
+            if hasattr(tarfile, 'data_filter'):
+                entry = tarfile.data_filter(entry, datadir)
+            else:
+                # Re-implement a sane subset
+                dest_path = os.path.realpath(datadir)
+                # Ensure we stay in the destination
+                target_path = os.path.realpath(os.path.join(dest_path, entry.name))
+                if os.path.commonpath([target_path, dest_path]) != dest_path:
+                    raise OutsideDestinationError(member, target_path)
+
+            sanitized = tarfile.TarInfo(name=entry.name)
+            sanitized.size = entry.size
+            return sanitized
+        return impl
+
+
+class SvdDlFormatPlain(SvdDlFormat):
+    @property
+    def id(self) -> str:
+        return "plain"
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def fileext(self) -> str:
+        return ''
+
+    @staticmethod
+    @abstractmethod
+    def _decompress_file(compressed: str, target: str) -> None:
+        if compressed == target:
+            return
+
+        shutil.copyfile(compressed, target)
+
+    @staticmethod
+    @abstractmethod
+    def _decompress_archive(compressed: str, path: str, targets: Dict[str, str]) -> None:
+        raise NotImplementedError(f'Uncompressed archives are not implemented')
+
+
+class SvdDlFormatGzip(SvdDlFormat):
+    @property
+    def id(self) -> str:
+        return "gzip"
+
+    @property
+    def prio(self) -> int:
+        return 1
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def fileext(self) -> str:
+        return '.gz'
+
+    @staticmethod
+    def _decompress_file(compressed: str, target: str) -> None:
+        with gzip.open(compressed, 'rb') as f_in:
+            with open(target, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+
+    @staticmethod
+    def _decompress_archive(compressed: str, path: str, targets: Dict[str, str]) -> None:
+        with tarfile.open(compressed, mode='r:gz') as tar:
+            tar.extraction_filter = SvdDlFormat._gen_extract_filter(datadir=path, targets=targets)
+            tar.extractall(path=path)
+
+
+class SvdDlFormatZstd(SvdDlFormat):
+    @property
+    def id(self) -> str:
+        return "zstd"
+
+    @property
+    def prio(self) -> int:
+        return 2
+
+    @property
+    def available(self) -> bool:
+        return have_zstd
+
+    @property
+    def fileext(self) -> str:
+        return '.zstd'
+
+    @staticmethod
+    def _decompress_file(compressed: str, target: str) -> None:
+        with ZstdFile(compressed, 'rb') as f_in:
+            with open(target, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+
+    @staticmethod
+    def _decompress_archive(compressed: str, path: str, targets: Dict[str, str]) -> None:
+        with pyzstd.ZstdFile(compressed, 'rb') as f_in:
+            with tarfile.open(fileobj=f_in, mode='r:') as tar:
+                tar.extraction_filter = SvdDlFormat._gen_extract_filter(datadir=path, targets=targets)
+                tar.extractall(path=path)
 
 
 class SvdDl:
@@ -75,6 +215,12 @@ class SvdDl:
         r'^([a-zA-Z0-9_-]+)(\.([a-zA-Z0-9_-]+)){0,3}$')
     _svd_hash_matcher = re.compile(
         r'^[a-z0-9_-]{128}$')
+
+    _download_formats = [
+        SvdDlFormatZstd(),
+        SvdDlFormatGzip(),
+        SvdDlFormatPlain(),
+    ]
 
     def __init__(self, repo=CMSIS_SVD_DATA_URL, datadir=LOCAL_DATA_DIR):
         socket.setdefaulttimeout(2)
@@ -184,40 +330,6 @@ class SvdDl:
             retry_count += 1
             time.sleep(random.randrange(*delay))
 
-    @staticmethod
-    def _decompress_file_gz(compressed: str, target: str) -> None:
-        with gzip.open(compressed, 'rb') as f_in:
-            with open(target, 'wb') as f_out:
-                shutil.copyfileobj(f_in, f_out)
-
-    @staticmethod
-    def _decompress_file_zstd(compressed: str, target: str) -> None:
-        with ZstdFile(compressed, 'rb') as f_in:
-            with open(target, 'wb') as f_out:
-                shutil.copyfileobj(f_in, f_out)
-
-    def _decompress_archive_extract_filter(self, entry: tarfile.TarInfo, targets: Dict[str, str]) -> Optional[tarfile.TarInfo]:
-        if not entry.isreg():
-            return None
-
-        if entry.name not in targets.values():
-            return None
-
-        entry = tarfile.data_filter(entry, self.datadir)
-
-        sanitized = tarfile.TarInfo(name=entry.name)
-        sanitized.size = entry.size
-        return sanitized
-
-    def _decompress_archive_gz(self, compressed: str, path: str, targets: Dict[str, str]) -> None:
-        with tarfile.open(compressed, mode='r:gz') as tar:
-            tar.extractall(path=path, filter=lambda m, p: self._decompress_archive_extract_filter(m, targets))
-
-    def _decompress_archive_zstd(self, compressed: str, path: str, targets: Dict[str, str]) -> None:
-        with pyzstd.ZstdFile(compressed, 'rb') as f_in:
-            with tarfile.open(fileobj=f_in, mode='r:') as tar:
-                tar.extractall(path=path, filter=lambda m, p: self._decompress_archive_extract_filter(m, targets))
-
     def dl_svd_to_local(self, dotted_name: str):
         if dotted_name not in self.index_json['files']:
             raise SvdDlError(f'SVD resource {dotted_name} could not be found in the index')
@@ -225,10 +337,11 @@ class SvdDl:
         svd_info = self.index_json['files'][dotted_name]
         svd_hash = svd_info['hash']
 
-        svd_path_part = dotted_name.replace('.', os.sep) + '.svd'
+        if 'plain' not in svd_info["paths"]:
+            raise SvdDlError(f'SVD resource {dotted_name} has no associated local path in the index')
+
+        svd_path_part = svd_info["paths"]["plain"]
         svd_path = self._datapath(svd_path_part)
-        svd_path_gzip = self._datapath(svd_path_part + '.gz')
-        svd_path_zstd = self._datapath(svd_path_part + '.zstd')
 
         if os.path.exists(svd_path):
             if not os.path.isfile(svd_path):
@@ -243,38 +356,33 @@ class SvdDl:
         os.makedirs(os.path.dirname(svd_path), exist_ok=True)
 
         print(f'[i] Downloading: "{dotted_name}"')
-        svd_url_plain = self._repourl(svd_info["paths"]["plain"])
-        svd_url_gzip = self._repourl(svd_info["paths"]["gzip"])
-        svd_url_zstd = self._repourl(svd_info["paths"]["zstd"])
+        errors = []
+        for fmt in sorted(self._download_formats, key=lambda f: f.prio, reverse=True):
+            if not fmt.available:
+                continue
+            if fmt.id not in svd_info["paths"]:
+                continue
 
-        have_file = False
-        if have_zstd:
+            svd_relname = svd_info["paths"][fmt.id]
+            svd_url_fmt = self._repourl(svd_relname)
+            svd_path_fmt = self._dataurl(svd_relname)
+
             try:
-                self._urlretrieve_wrapper(svd_url_zstd, svd_path_zstd)
+                self._urlretrieve_wrapper(svd_url_fmt, svd_path_fmt)
                 try:
-                    self._decompress_file_zstd(svd_path_zstd, svd_path)
+                    fmt._decompress_file(svd_path_fmt, svd_path)
                 finally:
-                    os.unlink(svd_path_zstd)
-                have_file = True
-            except:
-                have_file = False
+                    os.unlink(svd_path_fmt)
 
-        if not have_file:
-            try:
-                self._urlretrieve_wrapper(svd_url_gzip, svd_path_gzip)
-                try:
-                    self._decompress_file_gz(svd_path_gzip, svd_path)
-                finally:
-                    os.unlink(svd_path_gzip)
-                have_file = True
-            except:
-                have_file = False
+                if self._get_file_hash(svd_path) != svd_hash:
+                    raise SvdDlError(f'Downloaded SVD file for "{dotted_name}" is corrupted.')
 
-        if not have_file:
-            self._urlretrieve_wrapper(svd_url_plain, svd_path)
+                return
+            except Exception as e:
+                errors.append(e)
 
-        if self._get_file_hash(svd_path) != svd_hash:
-            raise SvdDlError(f'Downloaded SVD file for "{dotted_name}" is corrupted.')
+        # Should not reach here
+        raise SvdDlError(f'Failed to download {dotted_name}', errors)
 
     def dl_pack_to_local(self, dotted_name: str):
         if dotted_name not in self.index_json['packages']:
@@ -293,7 +401,7 @@ class SvdDl:
 
             file_info = self.index_json['files'][k]
 
-            ef = os.path.join(LOCAL_DATA_DIR, v)
+            ef = self._datapath(v)
             if os.path.exists(ef):
                 file_hash = self._get_file_hash(ef)
                 if file_hash == file_info['hash']:
@@ -306,114 +414,90 @@ class SvdDl:
             print(f'[+] Nothing left to update for pack: {dotted_name}')
             return
 
-        have_archive = False
+        errors = []
+        for fmt in sorted(self._download_formats, key=lambda f: f.prio, reverse=True):
+            if not fmt.available:
+                continue
+            if fmt.id not in pack_info['files']:
+                continue
 
-        # Download pack via zstd if available
-        if 'zstd' in pack_info['files'] and have_zstd:
-            pack_relname = pack_info["files"]["zstd"]["name"]
-            pack_url_zstd = self._repourl(pack_relname)
-            pack_path_zstd = self._datapath(pack_relname)
+            fmt_info = pack_info["files"][fmt.id]
+
+            # Download pack via format class
+            pack_relname = fmt_info["name"]
+            pack_url_fmt = self._repourl(pack_relname)
+            pack_path_fmt = self._datapath(pack_relname)
             try:
-                print(f'[i] Downloading pack "{dotted_name}" from "{pack_url_zstd}"')
-                self._urlretrieve_wrapper(pack_url_zstd, pack_path_zstd)
+                print(f'[i] Downloading pack "{dotted_name}" from "{pack_url_fmt}"')
+                self._urlretrieve_wrapper(pack_url_fmt, pack_path_fmt)
 
-                #   Extract pack from .tar.zstd
+                # Extract pack from .tar.zstd
                 try:
-                    self._decompress_archive_zstd(pack_path_zstd, LOCAL_DATA_DIR, extract_files)
+                    fmt._decompress_archive(pack_path_fmt, LOCAL_DATA_DIR, extract_files)
                 finally:
-                    os.unlink(pack_path_zstd)
+                    os.unlink(pack_path_fmt)
 
-                have_archive = True
-            except:
-                have_archive = False
+                # Verify extracted files
+            except Exception as e:
+                errors.append(e)
 
-        # Download pack via gzip if available
-        if 'gzip' in pack_info['files'] and not have_archive:
-            pack_relname = pack_info["files"]["gzip"]["name"]
-            pack_url_gzip = self._repourl(pack_relname)
-            pack_path_gzip = self._datapath(pack_relname)
-            try:
-                print(f'[i] Downloading pack "{dotted_name}" from "{pack_url_gzip}"')
-                self._urlretrieve_wrapper(pack_url_gzip, pack_path_gzip)
-
-                #   Extract pack from .tar.gz
-                try:
-                    self._decompress_archive_gz(pack_path_gzip, LOCAL_DATA_DIR, extract_files)
-                finally:
-                    os.unlink(pack_path_gzip)
-
-                have_archive = True
-            except:
-                have_archive = False
-
-        if not have_archive:
-            raise SvdDlError(f'Failed to download SVD resource pack for "{dotted_name}".')
-
-        # Verify extracted files
-
-        pass
+        # Should not reach here
+        raise SvdDlError(f'Failed to download {dotted_name}', errors)
 
     def download_svd(self, download_string: str) -> None:
         download_files, download_packs = [], []
-        os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+        os.makedirs(self.datadir, exist_ok=True)
+
+        local_index = self._datapath(INDEX_JSON)
+        local_hash = self._datapath(INDEX_HASH)
 
         print(f'[i] Downloading: index.hash')
 
-        self._urlretrieve_wrapper(self._repourl(INDEX_HASH), LOCAL_DATA_INDEX_HASH)
+        self._urlretrieve_wrapper(self._repourl(INDEX_HASH), local_hash)
 
         print(f'[i] Downloading: index.json')
 
         have_index = False
 
-        if os.path.exists(LOCAL_DATA_INDEX_JSON):
-            if self._get_hash_from_index_hash(LOCAL_DATA_INDEX_HASH, 'index.json') == self._get_file_hash(LOCAL_DATA_INDEX_JSON):
+        if os.path.exists(local_index):
+            if self._get_hash_from_index_hash(local_hash, INDEX_JSON) == self._get_file_hash(local_index):
                 have_index = True
-
-        if not have_index and have_zstd:
-            try:
-                self._urlretrieve_wrapper(self._repourl(INDEX_JSON_ZSTD), LOCAL_DATA_INDEX_JSON_ZSTD)
-                index_json_hash = self._get_file_hash(LOCAL_DATA_INDEX_JSON_ZSTD)
-                index_json_hash_valid = self._get_hash_from_index_hash(LOCAL_DATA_INDEX_HASH, target=INDEX_JSON_ZSTD)
-                if index_json_hash != index_json_hash_valid:
-                    raise SvdDlError(f'"{INDEX_JSON_ZSTD}" is corrupted.')
-
-                try:
-                    self._decompress_file_zstd(LOCAL_DATA_INDEX_JSON_ZSTD, LOCAL_DATA_INDEX_JSON)
-                finally:
-                    os.unlink(LOCAL_DATA_INDEX_JSON_ZSTD)
-
-                have_index = True
-            except:
-                have_index = False
 
         if not have_index:
-            try:
-                self._urlretrieve_wrapper(self._repourl(INDEX_JSON_GZIP), LOCAL_DATA_INDEX_JSON_GZIP)
-                index_json_hash = self._get_file_hash(LOCAL_DATA_INDEX_JSON_GZIP)
-                index_json_hash_valid = self._get_hash_from_index_hash(LOCAL_DATA_INDEX_HASH, target=INDEX_JSON_GZIP)
+            for fmt in sorted(self._download_formats, key=lambda f: f.prio, reverse=True):
+                if not fmt.available:
+                    continue
+
+                index_relname = fmt._add_fileext(INDEX_JSON)
+                index_url = self._repourl(index_relname)
+                index_path = self._datapath(index_relname)
+
+                self._urlretrieve_wrapper(index_url, index_path)
+                index_json_hash = self._get_file_hash(index_path)
+                index_json_hash_valid = self._get_hash_from_index_hash(local_hash, target=index_relname)
                 if index_json_hash != index_json_hash_valid:
-                    raise SvdDlError(f'"{INDEX_JSON_GZIP}" is corrupted.')
+                    raise SvdDlError(f'"{index_relname}" is corrupted.')
 
                 try:
-                    self._decompress_file_gz(LOCAL_DATA_INDEX_JSON_GZIP, LOCAL_DATA_INDEX_JSON)
+                    fmt._decompress_file(index_path, local_index)
                 finally:
-                    os.unlink(LOCAL_DATA_INDEX_JSON_GZIP)
+                    if index_path != local_index:
+                        os.unlink(index_path)
 
                 have_index = True
-            except:
-                have_index = False
+                break
 
         if not have_index:
-            request.urlretrieve(self._repourl(INDEX_JSON), LOCAL_DATA_INDEX_JSON)
+            raise SvdDlError(f'Failed to refresh "{INDEX_JSON}"')
 
         # Check decompressed index.json
         print(f'[i] Validating: {INDEX_JSON}')
-        index_json_hash = self._get_file_hash(LOCAL_DATA_INDEX_JSON)
-        index_json_hash_valid = self._get_hash_from_index_hash(LOCAL_DATA_INDEX_HASH)
+        index_json_hash = self._get_file_hash(local_index)
+        index_json_hash_valid = self._get_hash_from_index_hash(local_hash, target=INDEX_JSON)
         if index_json_hash != index_json_hash_valid:
             raise SvdDlError(f'"{INDEX_JSON}" is corrupted.')
 
-        with open(LOCAL_DATA_INDEX_JSON, 'r') as f:
+        with open(local_index, 'r') as f:
             self.index_json = json.load(f)
 
         if not self._validate_index():
